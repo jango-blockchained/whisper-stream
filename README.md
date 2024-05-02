@@ -19,6 +19,8 @@ Run the following commands:
 > brew install whisper-stream
 ```
 
+That's it! The `whisper-stream` command should now be available in your terminal.
+
 ### Manual Installation
 
 1. Install the following dependencies:
