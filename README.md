@@ -30,11 +30,12 @@ That's it! The `whisper-stream` command should now be available in your terminal
 - `sox`
 - `xclip` (for Linux)
 - `alsa-utils` (optional for Linux)
+- `libsox-fmt-mp3` (optional for Linux)
 
 On a Debian-based Linux distribution, you can install these dependencies with:
 
 ```bash
-sudo apt-get install curl jq sox xclip alsa-utils
+sudo apt-get install curl jq sox xclip alsa-utils libsox-fmt-mp3
 ```
 
 2. Identify a directory in your system's PATH variable where you want to place the script. You can check the directories in your PATH variable by running the following command:
@@ -46,7 +47,7 @@ sudo apt-get install curl jq sox xclip alsa-utils
 3. Move the `whisper-stream` script to the chosen directory. For example, if you want to move it to `/usr/local/bin`, run the following command:
 
 ```bash
-> mv whisper-stream /usr/local/bin
+> sudo ln -s $(pwd)/whisper-stream /usr/local/bin/whisper-stream
 ```
 
 4. Make sure the script is executable by running the following command:
