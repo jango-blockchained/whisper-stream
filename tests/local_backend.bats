@@ -180,6 +180,22 @@ setup() {
   [ "$(echo "$json" | jq -r '.text')" = "fake local transcription" ]
   # Model field should carry a local: prefix with the file basename
   [[ "$(echo "$json" | jq -r '.model')" == local:ggml-fake.bin ]]
+  # whisper-cli reports no detection result, so languages is null
+  echo "$json" | jq -e 'has("languages") and .languages == null' >/dev/null
+}
+
+@test "local backend + --jsonl reports the measured duration" {
+  cat > "$BATS_TEST_TMPDIR/bin/soxi" <<'STUB'
+#!/usr/bin/env bash
+echo "2.5"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/soxi"
+  JSONL_MODE=true
+  STDOUT_MODE=true
+  run convert_audio_to_text fake.mp3 4
+  local json
+  json=$(printf '%s\n' "$output" | grep '^{' | head -1)
+  echo "$json" | jq -e '.duration == 2.5 and .seq == 4' >/dev/null
 }
 
 # --- no leftover temp files ------------------------------------------------
@@ -233,17 +249,45 @@ STUB
 @test "validate_config warns when -m is set for backend=local" {
   BACKEND="local"
   MODEL="gpt-4o-transcribe"
+  MODEL_SET=true
   run validate_config
   [ "$status" -eq 0 ]
   [[ "$output" == *"-m/--model is ignored"* ]]
 }
 
-@test "validate_config does NOT warn when -m is at default for backend=local" {
+@test "validate_config does NOT warn when -m was not given for backend=local" {
   BACKEND="local"
-  MODEL="gpt-4o-mini-transcribe"
+  MODEL="gpt-transcribe"
+  MODEL_SET=false
   run validate_config
   [ "$status" -eq 0 ]
   [[ "$output" != *"-m/--model is ignored"* ]]
+}
+
+@test "the -m warning follows whether -m was given, not the default's name" {
+  # Regression: the check used to compare MODEL against a hard-coded default,
+  # so changing the default would have warned on every local run.
+  BACKEND="local"
+  MODEL="gpt-transcribe"
+  MODEL_SET=true
+  run validate_config
+  [[ "$output" == *"-m/--model is ignored"* ]]
+}
+
+@test "local backend rejects several --language codes" {
+  BACKEND="local"
+  LANGUAGE="en,ja"
+  run validate_config
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"single --language"* ]]
+}
+
+@test "local backend rejects --keyword" {
+  BACKEND="local"
+  KEYWORDS=("Kyoto")
+  run validate_config
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--keyword"* ]]
 }
 
 @test "validate_config warns when --model-path is set for backend=api" {

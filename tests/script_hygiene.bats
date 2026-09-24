@@ -8,10 +8,10 @@ SCRIPT="${BATS_TEST_DIRNAME}/../whisper-stream"
   bash -n "$SCRIPT"
 }
 
-@test "help text mentions gpt-4o-mini-transcribe" {
+@test "help text names gpt-transcribe as the default model" {
   run "$SCRIPT" --help
   [ "$status" -eq 0 ]
-  [[ "$output" == *"gpt-4o-mini-transcribe"* ]]
+  [[ "$output" == *"gpt-transcribe (default)"* ]]
 }
 
 @test "version flag works" {
@@ -68,10 +68,10 @@ SCRIPT="${BATS_TEST_DIRNAME}/../whisper-stream"
   [[ "$output" == *"dBFS"* ]] || [[ "$output" == *"-30d"* ]]
 }
 
-@test "version is 3.1.2" {
+@test "version is 3.2.0" {
   run "$SCRIPT" --version
   [ "$status" -eq 0 ]
-  [[ "$output" == *"3.1.2"* ]]
+  [[ "$output" == *"3.2.0"* ]]
 }
 
 @test "help text mentions --api-url" {

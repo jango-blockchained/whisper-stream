@@ -13,7 +13,7 @@
 - **パイプネイティブ出力**: `--stdout`でプレーンテキスト、`--jsonl`で発話1件ごとに1つのJSONオブジェクト。どちらもシェルツールやAIエージェントとの合成に適した形
 - **2つのバックエンド**: 品質と多言語対応のOpenAI音声認識API、または**無料・オフライン・プライベート**な常時起動ディクテーションのためのローカル`whisper.cpp`
 - **複数の出力モード**: プレーンテキスト、JSON Lines、クリップボードコピー、ファイル保存 — ワークフローに合わせて選択
-- **複数のAPIモデル**: `gpt-4o-transcribe`、`gpt-4o-mini-transcribe`(デフォルト)、`gpt-4o-transcribe-diarize`
+- **精度を上げるヒント**: キーワード(`--keyword`)、想定される複数の言語(`-l ja,en`)、自由記述のプロンプト。OpenAIの`gpt-transcribe`(デフォルト)で利用可能
 - **話者ダイアライゼーション**と既知話者登録(APIバックエンドの`gpt-4o-transcribe-diarize`のみ)
 - **リアルタイム/ファイルモード**で無音ベースの発話区切り
 
@@ -71,9 +71,11 @@ install -m 755 whisper-stream /usr/local/bin/
 
 **APIオプション(backend=api):**
 - `-t, --token <value>`: APIトークンを指定(OpenAIエンドポイント使用時のみ必須)
-- `-m, --model <value>`: モデルを指定。任意のモデル名はAPIにそのまま渡されます。未知のモデル名は警告のみ出るため、`gpt-4o-mini-transcribe-2025-12-15`のような日付付きスナップショットも指定可能です。既知の値: `gpt-4o-transcribe`、`gpt-4o-mini-transcribe`(デフォルト)、`gpt-4o-transcribe-diarize`。
+- `-m, --model <value>`: モデルを指定。任意のモデル名はAPIにそのまま渡され、未知のモデル名は警告のみ出ます。[モデル選択](#モデル選択apiバックエンド)を参照。
 - `-r, --prompt <value>`: プロンプトを指定(両バックエンドで有効)
-- `-l, --language <value>`: 入力言語をISO-639-1形式で指定
+- `-l, --language <value>`: 入力言語を`ja`のようなISO 639-1コードで指定。`gpt-transcribe`では、複数の言語が混ざる発話向けに複数指定できます: `-l ja,en`。
+- `--keyword <term>`: 音声に出てくると想定される語(製品名、略語、人名など)。複数指定するときは繰り返します。`gpt-transcribe`専用。キーワードはヒントであり、話されたときに正しく表記させるためのもので、話されていない語を出力させるものではありません。
+- `--keywords-file <file>`: キーワードをファイルから読み込みます。1行に1語(空行は無視)。語にカンマを含めることはできますが、`<`と`>`は使えません。
 - `-tr, --translate`: 書き起こしテキストを英語に翻訳(ローカルバックエンドのみ)
 
 **出力オプション:**
@@ -81,9 +83,16 @@ install -m 755 whisper-stream /usr/local/bin/
 - `-p2, --pipe-to <cmd>`: 書き起こしテキストを指定コマンドにパイプ(例: `'wc -w'`)
 - `-q, --quiet`: バナーと設定表示を抑制
 - `--stdout`: 書き起こしをstdoutにのみ出力。バナー・クリップボード・ファイル出力・進捗表示を全て抑制します。シェルパイプライン向け。
-- `--jsonl`: 発話ごとに1つのJSONオブジェクトを出力: `{version, ts, model, duration, text}`。`--stdout`を暗黙に含み、`--diarize`とは併用不可。リアルタイムモードでAPIバックエンドを使っている場合、行の順序は発話順と異なる場合があります — 厳密な順序が必要なら`ts`でソートするか`--oneshot`を使用してください。
+- `--jsonl`: 発話ごとに1つのJSONオブジェクトを出力: `{version, seq, ts, model, duration, languages, text}`。`--stdout`を暗黙に含み、`--diarize`とは併用不可。
+  - `seq`: 発話を録音した順番(1, 2, 3, …)。リアルタイムモードでAPIバックエンドを使う場合、リクエストが並行して走るため行の順序が発話順と異なることがあります。厳密な順序が必要なら`seq`で並べ替えてください(`ts`は書き起こしが終わった時刻なので、発話順にはなりません)。
+  - `duration`: `soxi`で測った音声の長さ(秒)。測れないときは`null`。
+  - `languages`: モデルが検出した言語。例: `[{"code":"ja"}]`。判定できなかったときは`[]`、モデルが報告しないとき(`gpt-transcribe`以外)は`null`。`-l`の値をそのまま写したものではありません。
+  - 利用側は知らないフィールドを無視してください。フィールドは`version`を変えずに追加されることがあります。
 
 **ダイアライゼーションオプション(`gpt-4o-transcribe-diarize`専用):**
+
+> OpenAIは`gpt-4o-transcribe-diarize`を2027-02-26にAPIから削除する予定で、話者ラベルを出せる後継モデルは発表されていません。その日以降、OpenAIのエンドポイントではこれらのオプションが使えなくなります。
+
 - `--diarize`: 話者ダイアライゼーションを有効化
 - `--register-speakers`: 既知話者を対話的に登録(ファイルモードのみ)
 - `--list-speakers`: 保存された話者サンプルを一覧表示
@@ -100,8 +109,11 @@ install -m 755 whisper-stream /usr/local/bin/
 # デフォルト: 連続録音、クリップボードにコピー
 whisper-stream
 
-# 入力言語を指定(ISO-639-1)
+# 入力言語を指定(ISO 639-1)
 whisper-stream -l ja
+
+# 日英が混ざる発話を、専門用語のヒント付きで
+whisper-stream -l ja,en --keyword "Kubernetes" --keyword "whisper.cpp"
 
 # 英語への翻訳(ローカルバックエンドが必要)
 whisper-stream --backend local --translate
@@ -167,6 +179,8 @@ whisper-stream -b local --jsonl | jq -r '.text'
 |-----------------------------------|:-----:|:-------:|
 | 基本の書き起こし                  |   ✓   |    ✓    |
 | `--language`、`--prompt`          |   ✓   |    ✓    |
+| 複数言語の指定(`-l ja,en`)       |   ✓   |    –    |
+| `--keyword`、`--keywords-file`    |   ✓   |    –    |
 | `--translate`(英語への翻訳)      |   –   |    ✓    |
 | `--vad`(組み込みVAD)             |   –   |    ✓    |
 | `--stdout`、`--jsonl`             |   ✓   |    ✓    |
@@ -198,9 +212,11 @@ whisper-stream --api-url http://127.0.0.1:2022/v1/audio/transcriptions
 
 ## モデル選択(APIバックエンド)
 
-- `gpt-4o-mini-transcribe`(デフォルト) — 汎用的な書き起こし。最速・最安
-- `gpt-4o-transcribe` — 最高品質
-- `gpt-4o-transcribe-diarize` — `--diarize`(複数話者)に必要
+- `gpt-transcribe`(デフォルト) — OpenAIが推奨する書き起こしモデル。`--keyword`と複数の`-l`に対応し、`--jsonl`で検出言語を報告します。
+- `gpt-4o-transcribe-diarize` — `--diarize`(複数話者)に必要。2027-02-26にOpenAIが削除予定。
+- `gpt-4o-transcribe`、`gpt-4o-mini-transcribe` — 2027-02-26にOpenAIが削除するまでは(警告付きで)使えます。`-l`は1言語のみ、キーワードは非対応です。
+
+日付付きスナップショット(例: `gpt-transcribe-2027-03-01`)はそのまま渡されます。`gpt-live-transcribe`はOpenAIのRealtimeセッション専用で、このツールが使うファイル書き起こしのエンドポイントでは動かないため拒否されます。これらの検査はOpenAIのエンドポイントにだけ適用され、`--api-url`使用時はモデル名を検査せずに渡します。
 
 英語への翻訳には`--backend local --translate`を使ってください(whisper.cppがネイティブ対応)。
 

@@ -73,7 +73,61 @@ setup() {
   [ "$(echo "$json" | jq -r '.text')" = "fake transcription" ]
   # ts is an ISO-8601 UTC string
   [[ "$(echo "$json" | jq -r '.ts')" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
-  # duration is null unless verbose_json returned a number
+  # fake.mp3 is not real audio, so soxi cannot measure it: duration is null
+  echo "$json" | jq -e '.duration == null' >/dev/null
+  # no seq argument (library call) and no detection in the response
+  echo "$json" | jq -e 'has("seq") and .seq == null' >/dev/null
+  echo "$json" | jq -e 'has("languages") and .languages == null' >/dev/null
+}
+
+@test "JSONL carries seq, measured duration, and detected languages" {
+  cat > "$BATS_TEST_TMPDIR/bin/soxi" <<'STUB'
+#!/usr/bin/env bash
+echo "4.179592"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/soxi"
+  cat > "$BATS_TEST_TMPDIR/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '{"text":"bonjour","languages":[{"code":"fr"}],"usage":{"type":"duration","seconds":5}}\n200'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+  JSONL_MODE=true
+  STDOUT_MODE=true
+  run convert_audio_to_text fake.mp3 7
+  local json
+  json=$(printf '%s\n' "$output" | grep '^{' | head -1)
+  echo "$json" | jq -e '.seq == 7' >/dev/null
+  # measured input duration (soxi), not the billed usage.seconds
+  echo "$json" | jq -e '.duration == 4.18' >/dev/null
+  echo "$json" | jq -e '.languages == [{"code":"fr"}]' >/dev/null
+}
+
+@test "JSONL keeps an empty detection result as [] (not null)" {
+  cat > "$BATS_TEST_TMPDIR/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '{"text":"hm","languages":[]}\n200'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+  JSONL_MODE=true
+  STDOUT_MODE=true
+  run convert_audio_to_text fake.mp3
+  local json
+  json=$(printf '%s\n' "$output" | grep '^{' | head -1)
+  echo "$json" | jq -e '.languages == []' >/dev/null
+}
+
+@test "JSONL duration is null when soxi prints something non-numeric" {
+  cat > "$BATS_TEST_TMPDIR/bin/soxi" <<'STUB'
+#!/usr/bin/env bash
+echo "soxi FAIL formats: can't open input file"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/soxi"
+  JSONL_MODE=true
+  STDOUT_MODE=true
+  run convert_audio_to_text fake.mp3
+  [ "$status" -eq 0 ]
+  local json
+  json=$(printf '%s\n' "$output" | grep '^{' | head -1)
   echo "$json" | jq -e '.duration == null' >/dev/null
 }
 
@@ -178,4 +232,47 @@ STUB
 
   # Must match the transcription exactly, with no trailing \r\e[K or similar
   [ "$out" = "plain text check" ]
+}
+
+# --- locale independence -------------------------------------------------------
+
+@test "JSONL duration stays a JSON number under a decimal-comma locale" {
+  # awk formats with the locale's decimal separator ("4,180"), which jq
+  # --argjson rejects; the record used to vanish while returning success.
+  locale -a 2>/dev/null | grep -qx 'de_DE.UTF-8' || skip "de_DE.UTF-8 locale not installed"
+  cat > "$BATS_TEST_TMPDIR/bin/soxi" <<'STUB'
+#!/usr/bin/env bash
+echo "4.179592"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/soxi"
+  JSONL_MODE=true
+  STDOUT_MODE=true
+  LC_ALL=de_DE.UTF-8
+  export LC_ALL
+  run convert_audio_to_text fake.mp3 1
+  [ "$status" -eq 0 ]
+  local json
+  json=$(printf '%s\n' "$output" | grep '^{' | head -1)
+  echo "$json" | jq -e '.duration == 4.18' >/dev/null
+}
+
+# --- CLI errors keep stdout clean ------------------------------------------------
+
+@test "option parsing errors go to stderr, not the transcript stream" {
+  local out rc
+  for args in "--keyword" "--keywords-file" "--language" "--no-such-option"; do
+    rc=0
+    out=$("$BATS_TEST_DIRNAME/../whisper-stream" --jsonl $args 2>/dev/null) || rc=$?
+    [ "$rc" -ne 0 ]
+    [ -z "$out" ]
+  done
+}
+
+@test "--keyword=<term> accepts a term that starts with a hyphen" {
+  printf 'x' > fake.mp3  # file mode rejects empty files
+  run env OPENAI_API_KEY=sk-test "$BATS_TEST_DIRNAME/../whisper-stream" --stdout -f fake.mp3 \
+        --keyword=-Werror --keyword=--jsonl
+  [ "$status" -eq 0 ]
+  grep -Fxq 'keywords[]=-Werror' "$CURL_CAPTURE"
+  grep -Fxq 'keywords[]=--jsonl' "$CURL_CAPTURE"
 }

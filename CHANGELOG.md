@@ -10,6 +10,79 @@ a major bump.
 This file is updated when substantive changes happen; small refactors,
 comment tweaks, and cosmetic fixes are not recorded here.
 
+## [3.2.0] — 2026-09-24
+
+OpenAI now recommends `gpt-transcribe` for file transcription and has
+announced (2026-08-26) that `whisper-1`, `gpt-4o-transcribe`,
+`gpt-4o-mini-transcribe`, and `gpt-4o-transcribe-diarize` will be removed
+from its API on 2027-02-26. This release moves to the new model and adds
+its context hints.
+
+### Changed
+
+- **Default model is now `gpt-transcribe`** (was `gpt-4o-mini-transcribe`).
+  Note the price: $0.0045/min, 1.5× the old default's $0.003/min. Pass
+  `-m gpt-4o-mini-transcribe` to keep the old model until OpenAI removes it.
+- **The gpt-4o-* models warn at startup** with their OpenAI removal date
+  (2027-02-26; 2027-01-20 for `gpt-4o-mini-transcribe-2025-03-20`). They
+  keep working until then.
+- **`--diarize` warns that it has an end date.** `gpt-4o-transcribe-diarize`
+  is removed on 2027-02-26 and OpenAI has announced no replacement that
+  keeps speaker labels (`gpt-transcribe` rejects `diarized_json`).
+- **`gpt-live-transcribe` and `gpt-realtime-whisper` are rejected** with an
+  explanation: they only work in Realtime sessions, not with
+  `/v1/audio/transcriptions`.
+- **OpenAI's model rules no longer apply to `--api-url` servers.** Removal
+  warnings, the unknown-model warning, and the `whisper-1` / Realtime
+  rejections are skipped for self-hosted endpoints, which accept whatever
+  model names they like.
+
+### Added
+
+- **`--keyword <term>` (repeatable) and `--keywords-file <file>`** send
+  `keywords[]` hints to `gpt-transcribe`. The file holds one term per line
+  (CRLF and blank lines are fine), so terms may contain commas. Terms with
+  `<`, `>`, or a line break are rejected before sending, because the API
+  rejects the whole request with only "Invalid request.". Use
+  `--keyword=<term>` for a term that starts with `-`.
+- **Several languages with `-l en,ja`.** `gpt-transcribe` receives
+  `languages[]` (also for a single code — the API rejects `language` and
+  `languages` together). The gpt-4o-* models and the local backend accept
+  one code and reject a list.
+- **A hint after a bare "Invalid request."** (HTTP 400) when a language,
+  keyword, or prompt was sent, since the API does not say which was wrong.
+- **JSONL fields `seq`, `languages`, and a real `duration`** (schema stays
+  version 1; the fields are additive):
+  - `seq` is the capture order. `ts` is when transcription finished, so
+    the previous advice to sort by `ts` did not restore speaking order —
+    sort by `seq` instead.
+  - `languages` is what `gpt-transcribe` detected (`[]` when it could not
+    tell, `null` when the model does not report it).
+  - `duration` is the measured audio length from `soxi` in both real-time
+    and file mode, `null` when it cannot be measured. It was always `null`
+    since 3.0.0.
+- Real-time chunk files are named by sequence number instead of by the
+  second, so two utterances ending in the same second no longer collide.
+
+### Fixed
+
+- **Text form fields are sent literally.** They went through curl's
+  `--form`, which reads a value starting with `<` from a file and uploads
+  one starting with `@`: `-r "@team notes"` failed, and `-r "<path"` sent
+  that file's contents as the prompt. Prompt, language, model, keywords,
+  and speaker names now use `--form-string`.
+- **The `-m` warning for the local backend** now fires when `-m` was given,
+  instead of comparing the model name against the default.
+- **Option-parsing errors go to stderr.** "Missing value", "Unknown
+  option", and similar messages were printed to stdout, where they mixed
+  into `--stdout` / `--jsonl` output.
+
+### Corrected
+
+- **3.0.0 wrongly said OpenAI retired `whisper-1` on 2026-06-01.** It is
+  still available and is removed on 2027-02-26. whisper-stream keeps not
+  supporting it (as since 3.0.0); only the error message changed.
+
 ## [3.1.2] — 2026-07-25
 
 ### Fixed
@@ -119,6 +192,11 @@ comment tweaks, and cosmetic fixes are not recorded here.
   has no equivalent flag).
 
 ## [3.0.0] — 2026-04-12
+
+> **Correction (3.2.0):** the retirement date below was wrong. OpenAI did
+> not retire `whisper-1` or the gpt-4o-* transcription models on
+> 2026-06-01; it announced on 2026-08-26 that they are removed on
+> 2027-02-26. The changes this release made stand.
 
 This release prunes features that depend on the `whisper-1` model — which
 OpenAI is retiring on 2026-06-01 along with the original `gpt-4o-transcribe`

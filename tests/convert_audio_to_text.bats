@@ -374,3 +374,101 @@ STUB
   [ "$status" -ne 0 ]
   [[ "$output" == *"502"* ]]
 }
+
+# --- literal form fields (--form-string) -------------------------------------
+#
+# With --form, curl itself interprets a value starting with `<` (read a file)
+# or `@` (upload a file). Text fields must go through --form-string.
+
+# Print the argument that precedes the exact argv entry $1 in the capture.
+arg_before() {
+  local prev="" line
+  while IFS= read -r line; do
+    if [ "$line" = "$1" ]; then
+      printf '%s\n' "$prev"
+      return 0
+    fi
+    prev="$line"
+  done < "$CURL_CAPTURE"
+  return 1
+}
+
+@test "a prompt starting with < or @ is sent literally via --form-string" {
+  PROMPT="<secret.txt"
+  convert_audio_to_text fake.mp3 >/dev/null
+  [ "$(arg_before 'prompt=<secret.txt')" = "--form-string" ]
+
+  : > "$CURL_CAPTURE"
+  PROMPT="@team meeting notes"
+  convert_audio_to_text fake.mp3 >/dev/null
+  [ "$(arg_before 'prompt=@team meeting notes')" = "--form-string" ]
+}
+
+@test "model and response_format are literal fields; only the audio uses --form" {
+  convert_audio_to_text fake.mp3 >/dev/null
+  [ "$(arg_before 'model=gpt-4o-mini-transcribe')" = "--form-string" ]
+  [ "$(arg_before 'response_format=json')" = "--form-string" ]
+  [ "$(arg_before 'file=@fake.mp3')" = "--form" ]
+}
+
+# --- languages and keywords --------------------------------------------------
+
+@test "gpt-transcribe sends even a single language as languages[]" {
+  MODEL="gpt-transcribe"
+  LANGUAGE="ja"
+  convert_audio_to_text fake.mp3 >/dev/null
+  grep -Fxq 'languages[]=ja' "$CURL_CAPTURE"
+  # The API rejects the singular and plural fields together.
+  run grep -Fxq 'language=ja' "$CURL_CAPTURE"
+  [ "$status" -ne 0 ]
+}
+
+@test "several languages are sent as repeated languages[] fields" {
+  MODEL="gpt-transcribe"
+  LANGUAGE="en, ja"
+  convert_audio_to_text fake.mp3 >/dev/null
+  [ "$(grep -c '^languages\[\]=' "$CURL_CAPTURE")" -eq 2 ]
+  grep -Fxq 'languages[]=en' "$CURL_CAPTURE"
+  grep -Fxq 'languages[]=ja' "$CURL_CAPTURE"
+}
+
+@test "keywords are sent as literal keywords[] fields" {
+  MODEL="gpt-transcribe"
+  KEYWORDS=("ACME, Inc." "@handle")
+  convert_audio_to_text fake.mp3 >/dev/null
+  grep -Fxq 'keywords[]=ACME, Inc.' "$CURL_CAPTURE"
+  [ "$(arg_before 'keywords[]=@handle')" = "--form-string" ]
+}
+
+@test "no languages[] or keywords[] fields are sent when unset" {
+  MODEL="gpt-transcribe"
+  convert_audio_to_text fake.mp3 >/dev/null
+  run grep -E '^(languages|keywords)\[\]=|^language=' "$CURL_CAPTURE"
+  [ "$status" -ne 0 ]
+}
+
+@test "a bare 'Invalid request.' gets a hint when languages/keywords were sent" {
+  cat > "$BATS_TEST_TMPDIR/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '{"error":{"message":"Invalid request.","code":"invalid_value"}}\n400'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+  MODEL="gpt-transcribe"
+  LANGUAGE="english"
+  run convert_audio_to_text fake.mp3
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Invalid request."* ]]
+  [[ "$output" == *"Hint:"* ]]
+}
+
+@test "no hint for 'Invalid request.' when no language/keyword/prompt was sent" {
+  cat > "$BATS_TEST_TMPDIR/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '{"error":{"message":"Invalid request.","code":"invalid_value"}}\n400'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+  MODEL="gpt-transcribe"
+  run convert_audio_to_text fake.mp3
+  [ "$status" -ne 0 ]
+  [[ "$output" != *"Hint:"* ]]
+}

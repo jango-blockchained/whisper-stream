@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Default configuration and versioning
-VERSION="3.1.2"
+VERSION="3.2.0"
 
 # Setting the default values for the script parameters
 MIN_VOLUME=1%                  # Minimum volume threshold
@@ -9,11 +9,14 @@ SILENCE_LENGTH=1.5             # Minimum silence duration in seconds
 ONESHOT=false                  # Flag to determine if the script should run once or continuously
 DURATION=0                     # Duration of the recording in seconds (0 means continuous)
 MIN_AUDIO_DURATION=0.3         # Skip utterances shorter than this many seconds
-MODEL="gpt-4o-mini-transcribe" # Model name for the API backend (slug auto-tracks the latest snapshot)
+MODEL="gpt-transcribe"         # Model name for the API backend
+MODEL_SET=false                # True when -m was given (the local backend warns that it is ignored)
 TOKEN=""                       # OpenAI API token (optional when --api-url points to a non-OpenAI endpoint)
 OUTPUT_DIR=""                  # Directory to save the transcriptions
 PROMPT=""                      # Prompt for the API call
-LANGUAGE=""                    # Language code for transcription
+LANGUAGE=""                    # Language code(s) for transcription; comma-separated for several
+declare -a LANGUAGES=()        # LANGUAGE split into codes (parse_language_list)
+declare -a KEYWORDS=()         # Terms expected in the audio (--keyword / --keywords-file; gpt-transcribe)
 TRANSLATE=""                   # Flag to translate to English (local backend only since v3.0)
 AUDIO_FILE=""                  # Specific audio file for transcription
 PIPE_TO_CMD=""                 # Command to pipe the transcribed text to
@@ -21,6 +24,11 @@ QUIET_MODE=false               # Flag to determine if the banner and settings sh
 STDOUT_MODE=false              # Pipe-native mode: transcript-only output, no clipboard/file side effects
 JSONL_MODE=false               # Emit one JSON object per utterance (implies STDOUT_MODE)
 JSONL_SCHEMA_VERSION=1         # Schema version for JSONL output; bump on breaking changes
+                               # (added fields such as seq/languages are not breaking)
+
+# OpenAI removes the gpt-4o-* transcription models and whisper-1 on this date
+# (deprecation notice of 2026-08-26). Used in the startup warnings.
+OPENAI_LEGACY_STT_SHUTDOWN="2027-02-26"
 
 # Backend selection
 BACKEND="api"                  # "api" (OpenAI or compatible) or "local" (whisper.cpp)
@@ -84,11 +92,17 @@ function display_help() {
   echo "  -t, --token <value>         Set the API token (only required for the OpenAI endpoint)"
   echo "  -m, --model <value>         Set the model. Any model name is passed through;"
   echo "                              unknown names produce a warning. Known values:"
-  echo "                              gpt-4o-transcribe, gpt-4o-mini-transcribe"
-  echo "                              (default), gpt-4o-transcribe-diarize, or dated"
-  echo "                              snapshots like gpt-4o-mini-transcribe-2025-12-15."
+  echo "                              gpt-transcribe (default), gpt-4o-transcribe-diarize"
+  echo "                              (for --diarize), and gpt-4o-transcribe /"
+  echo "                              gpt-4o-mini-transcribe (removed by OpenAI on"
+  echo "                              $OPENAI_LEGACY_STT_SHUTDOWN)."
   echo "  -r, --prompt <value>        Set the prompt (works on both backends)"
-  echo "  -l, --language <value>      Set the language in ISO-639-1 format"
+  echo "  -l, --language <value>      Set the input language as an ISO 639-1 code (e.g. 'en')."
+  echo "                              gpt-transcribe accepts several: '-l en,ja'."
+  echo "      --keyword <term>        A term expected in the audio (product name, acronym)."
+  echo "                              Repeat for more terms. gpt-transcribe only."
+  echo "                              Use --keyword=<term> for a term starting with '-'."
+  echo "      --keywords-file <file>  Read keywords from a file, one term per line."
   echo "  -tr, --translate            Translate to English (local backend only)"
   echo ""
   echo "Output Options:"
@@ -99,10 +113,11 @@ function display_help() {
   echo "                              Suppresses banner, clipboard, file output, and progress"
   echo "                              indicators. Intended for | pipe use with other tools."
   echo "      --jsonl                 Emit one JSON object per utterance (JSON Lines). Schema:"
-  echo "                              {version,ts,model,duration,text}. Implies --stdout."
-  echo "                              Not compatible with --diarize."
+  echo "                              {version,seq,ts,model,duration,languages,text}."
+  echo "                              Implies --stdout. Not compatible with --diarize."
   echo ""
-  echo "Diarization Options (gpt-4o-transcribe-diarize only):"
+  echo "Diarization Options (gpt-4o-transcribe-diarize only; OpenAI removes that model"
+  echo "on $OPENAI_LEGACY_STT_SHUTDOWN and has announced no replacement with speaker labels):"
   echo "  --diarize                   Enable speaker diarization"
   echo "  --register-speakers         Interactively register known speakers (file mode only)"
   echo "  --list-speakers             List saved speaker samples"
@@ -524,6 +539,75 @@ function resolve_whisper_cli() {
   return 1
 }
 
+# True when requests go to OpenAI itself. OpenAI's model rules (removal
+# dates, realtime-only models, retired names) do not apply to a self-hosted
+# server behind --api-url.
+function is_openai_endpoint() {
+  [ -z "$API_URL" ] || [[ "$API_URL" == https://api.openai.com/* ]]
+}
+
+# Models that take the plural `languages[]` and `keywords[]` fields.
+function model_takes_context_fields() {
+  [[ "$MODEL" == gpt-transcribe* ]]
+}
+
+# Models known NOT to take `languages[]` / `keywords[]`: they accept only the
+# singular `language` field. Unknown names are neither, and get a best effort.
+function model_is_legacy_openai() {
+  [[ "$MODEL" == gpt-4o-transcribe* || "$MODEL" == gpt-4o-mini-transcribe* || "$MODEL" == whisper-1* ]]
+}
+
+# Split LANGUAGE ("en", "en,ja", " en , ja ") into the LANGUAGES array.
+# Returns 1 when a list member is empty (e.g. "en,,ja" or a trailing comma)
+# or the value contains a line break (`read` would drop everything after it).
+function parse_language_list() {
+  LANGUAGES=()
+  [ -z "$LANGUAGE" ] && return 0
+  [[ "$LANGUAGE" == *[$'\r\n']* ]] && return 1
+  local -a parts=()
+  local part
+  IFS=',' read -ra parts <<< "$LANGUAGE"
+  # `read -a` drops one trailing empty field; catch "en," explicitly.
+  [[ "$LANGUAGE" == *, ]] && return 1
+  for part in "${parts[@]}"; do
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [ -z "$part" ] && return 1
+    LANGUAGES+=("$part")
+  done
+  return 0
+}
+
+# The API rejects the whole request, with only "Invalid request.", when a
+# keyword is empty or contains `<`, `>`, CR, or LF. Check before sending.
+function keyword_is_valid() {
+  local kw=$1
+  [ -n "$kw" ] && [[ "$kw" != *[$'<>\r\n']* ]]
+}
+
+# Append the terms in a keywords file to KEYWORDS: one term per line, CRLF
+# accepted, surrounding whitespace trimmed, blank lines skipped.
+function load_keywords_file() {
+  local file=$1
+  if [ ! -r "$file" ] || [ -d "$file" ]; then
+    echo "Error: cannot read keywords file: $file" >&2
+    exit 1
+  fi
+  local line lineno=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+    if ! keyword_is_valid "$line"; then
+      echo "Error: $file line $lineno: keywords must not contain '<' or '>': $line" >&2
+      exit 1
+    fi
+    KEYWORDS+=("$line")
+  done < "$file"
+}
+
 # Validate configuration and warn on unrecognized models.
 # Uses glob patterns so that snapshot names (e.g. gpt-4o-mini-transcribe-2025-12-15)
 # pass through to the API without being blocked by a hard-coded whitelist.
@@ -576,7 +660,7 @@ function validate_config() {
 
   # Warn when backend-specific options are set for the wrong backend.
   # Only fires when the value is non-default so we avoid noise.
-  if [ "$BACKEND" = "local" ] && [ "$MODEL" != "gpt-4o-mini-transcribe" ]; then
+  if [ "$BACKEND" = "local" ] && [ "$MODEL_SET" = true ]; then
     echo "Warning: -m/--model is ignored when --backend local is used; use --model-path to select a ggml model." >&2
   fi
   if [ "$BACKEND" = "api" ] && [ -n "$MODEL_PATH" ]; then
@@ -590,8 +674,29 @@ function validate_config() {
     exit 1
   fi
 
+  # -l accepts a comma-separated list; --keyword values are literal terms.
+  if ! parse_language_list; then
+    echo "Error: invalid --language list: '$LANGUAGE' (use comma-separated codes such as 'en,ja')" >&2
+    exit 1
+  fi
+  local i
+  for i in "${!KEYWORDS[@]}"; do
+    if ! keyword_is_valid "${KEYWORDS[$i]}"; then
+      echo "Error: keyword $((i + 1)) is empty or contains '<', '>', or a line break: '${KEYWORDS[$i]}'" >&2
+      exit 1
+    fi
+  done
+
   # Local backend feature compatibility.
   if [ "$BACKEND" = "local" ]; then
+    if [ ${#LANGUAGES[@]} -gt 1 ]; then
+      echo "Error: the local backend accepts a single --language (whisper-cli -l)" >&2
+      exit 1
+    fi
+    if [ ${#KEYWORDS[@]} -gt 0 ]; then
+      echo "Error: --keyword / --keywords-file are not supported by the local backend" >&2
+      exit 1
+    fi
     if [ "$DIARIZE" = true ]; then
       echo "Error: --diarize is not supported by the local backend" >&2
       exit 1
@@ -632,24 +737,61 @@ function validate_config() {
     return 0
   fi
 
-  # API backend validation below.
-  case "$MODEL" in
-    gpt-4o-transcribe*|gpt-4o-mini-transcribe*)
-      ;;
-    whisper-1*)
-      echo "Error: whisper-1 is no longer supported (retired 2026-06-01 by OpenAI)." >&2
-      echo "       Use gpt-4o-mini-transcribe (default) or gpt-4o-transcribe instead." >&2
-      echo "       For translation to English, use --backend local with --translate." >&2
-      exit 1
-      ;;
-    *)
-      echo "Warning: Unrecognized model '$MODEL'. Passing through to API." >&2
-      ;;
-  esac
+  # API backend validation below. Model names are recognised by glob so that
+  # dated snapshots pass; OpenAI-specific rules are skipped for --api-url
+  # servers, which accept whatever model names they like.
+  if is_openai_endpoint; then
+    case "$MODEL" in
+      gpt-transcribe*)
+        ;;
+      gpt-4o-transcribe-diarize*)
+        echo "Warning: $MODEL will be removed from the OpenAI API on $OPENAI_LEGACY_STT_SHUTDOWN." >&2
+        echo "         OpenAI has not announced a replacement that keeps speaker labels," >&2
+        echo "         so --diarize will stop working then." >&2
+        ;;
+      gpt-4o-mini-transcribe-2025-03-20)
+        echo "Warning: $MODEL will be removed from the OpenAI API on 2027-01-20." >&2
+        echo "         Use gpt-transcribe (the default) instead." >&2
+        ;;
+      gpt-4o-transcribe*|gpt-4o-mini-transcribe*)
+        echo "Warning: $MODEL will be removed from the OpenAI API on $OPENAI_LEGACY_STT_SHUTDOWN." >&2
+        echo "         Use gpt-transcribe (the default) instead." >&2
+        ;;
+      whisper-1*)
+        echo "Error: whisper-1 is not supported by whisper-stream since v3.0." >&2
+        echo "       (OpenAI removes it from the API on $OPENAI_LEGACY_STT_SHUTDOWN.)" >&2
+        echo "       Use gpt-transcribe (the default) instead." >&2
+        echo "       For translation to English, use --backend local with --translate." >&2
+        exit 1
+        ;;
+      gpt-live-transcribe*|gpt-realtime-whisper*)
+        echo "Error: $MODEL is a Realtime-session model and does not work with" >&2
+        echo "       /v1/audio/transcriptions. Use gpt-transcribe (the default) instead." >&2
+        exit 1
+        ;;
+      *)
+        echo "Warning: Unrecognized model '$MODEL'. Passing through to API." >&2
+        ;;
+    esac
+  fi
 
-  # Translation moved to local backend only in v3.0. The OpenAI
-  # /audio/translations endpoint required whisper-1 which is now retired.
-  # whisper.cpp's whisper-cli still supports translation natively.
+  # Language and keyword fields depend on the model. gpt-transcribe takes the
+  # plural fields; the gpt-4o-* models take one `language` and no keywords.
+  # Unknown models get the plural fields only when they are needed.
+  if model_is_legacy_openai; then
+    if [ ${#LANGUAGES[@]} -gt 1 ]; then
+      echo "Error: several --language codes require gpt-transcribe; $MODEL accepts one" >&2
+      exit 1
+    fi
+    if [ ${#KEYWORDS[@]} -gt 0 ]; then
+      echo "Error: --keyword / --keywords-file require gpt-transcribe; $MODEL does not support them" >&2
+      exit 1
+    fi
+  fi
+
+  # Translation has been local-only since v3.0: the OpenAI
+  # /audio/translations endpoint needs whisper-1, which whisper-stream no
+  # longer supports. whisper.cpp's whisper-cli translates natively.
   if [ -n "$TRANSLATE" ]; then
     echo "Error: --translate is only supported by the local backend (whisper.cpp) since v3.0." >&2
     echo "       Use: --backend local --translate" >&2
@@ -700,7 +842,7 @@ while [[ $# -gt 0 ]]; do
       # The guard must allow values that start with `-` when they look like a
       # dB number, otherwise short options would be misread as missing values.
       if [ -z "$2" ] || { [[ "$2" == -* ]] && ! [[ "$2" =~ ^-?[0-9]+(\.[0-9]+)?[d%]?$ ]]; }; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       MIN_VOLUME="$2"
@@ -713,7 +855,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -s|--silence)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       SILENCE_LENGTH="$2"
@@ -726,7 +868,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -d|--duration)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       DURATION="$2"
@@ -735,7 +877,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -t|--token)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       TOKEN="$2"
@@ -744,13 +886,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     -p|--path)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       OUTPUT_DIR="$2"
       # check if the output directory exists
       if [ ! -d "$OUTPUT_DIR" ]; then
-        echo "Directory does not exist: $OUTPUT_DIR"
+        echo "Directory does not exist: $OUTPUT_DIR" >&2
         exit 1
       fi
       shift
@@ -758,7 +900,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -r|--prompt)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       PROMPT="$2"
@@ -767,10 +909,33 @@ while [[ $# -gt 0 ]]; do
       ;;
     -l|--language)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       LANGUAGE="$2"
+      shift
+      shift
+      ;;
+    --keyword)
+      if [[ -z $2 || $2 == -* ]]; then
+        echo "Error: Missing value for $1" >&2
+        exit 1
+      fi
+      KEYWORDS+=("$2")
+      shift
+      shift
+      ;;
+    --keyword=*)
+      # The = form takes the rest literally, so terms may start with "-".
+      KEYWORDS+=("${1#--keyword=}")
+      shift
+      ;;
+    --keywords-file)
+      if [[ ! $2 || $2 == -* ]]; then
+        echo "Error: Missing value for $1" >&2
+        exit 1
+      fi
+      load_keywords_file "$2"
       shift
       shift
       ;;
@@ -780,7 +945,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -p2|--pipe-to)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing cmd for $1"
+        echo "Error: Missing cmd for $1" >&2
         exit 1
       fi
       PIPE_TO_CMD="$2"
@@ -789,7 +954,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     -f|--file)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       AUDIO_FILE="$2"
@@ -798,16 +963,17 @@ while [[ $# -gt 0 ]]; do
       ;;
     -m|--model)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       MODEL="$2"
+      MODEL_SET=true
       shift
       shift
       ;;
     -b|--backend)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       BACKEND="$2"
@@ -816,7 +982,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model-path)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       MODEL_PATH="$2"
@@ -825,7 +991,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --api-url)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       API_URL="$2"
@@ -838,7 +1004,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --vad-model-path)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       VAD_MODEL_PATH="$2"
@@ -859,7 +1025,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --delete-speaker)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       DELETE_SPEAKER="$2"
@@ -868,7 +1034,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --speaker-dir)
       if [[ ! $2 || $2 == -* ]]; then
-        echo "Error: Missing value for $1"
+        echo "Error: Missing value for $1" >&2
         exit 1
       fi
       SPEAKER_DIR="$2"
@@ -898,7 +1064,7 @@ while [[ $# -gt 0 ]]; do
       display_help
       ;;
     *)
-      echo "Unknown option: $1"
+      echo "Unknown option: $1" >&2
       exit 1
       ;;
   esac
@@ -1009,6 +1175,9 @@ function display_settings() {
   echo "  Volume threshold: $MIN_VOLUME"
   echo "  Silence length: $SILENCE_LENGTH seconds"
   echo "  Input language: ${LANGUAGE:-Not specified}"
+  if [ ${#KEYWORDS[@]} -gt 0 ]; then
+    echo "  Keywords: ${#KEYWORDS[@]}"
+  fi
 
   if [ -n "$TRANSLATE" ]; then
     echo "  Translate to English: $TRANSLATE"
@@ -1169,8 +1338,26 @@ function run_local_whisper_cpp() {
 # The real-time loop ignores this — one bad utterance must not end a session —
 # but file mode (-f) turns it into the process exit status so that callers
 # like `whisper-stream -f x.mp3 > out.txt || alert` can detect the failure.
+#
+# $2 (optional) is the utterance's capture sequence number, emitted as `seq`
+# in JSONL. API calls run concurrently, so completion order (and `ts`) can
+# differ from speaking order; `seq` cannot.
 function convert_audio_to_text() {
   local output_file=$1
+  local seq=${2:-}
+
+  # Measured input duration in seconds, reported as JSONL `duration`. Best
+  # effort in both modes: file mode does not require SoX, and soxi cannot
+  # read every format the API accepts, so anything non-numeric becomes null.
+  local duration=""
+  duration=$(soxi -D "$output_file" 2>/dev/null) || true
+  # LC_ALL=C: a decimal-comma locale would make awk print "4,180", which is
+  # not a JSON number.
+  if [[ "$duration" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    duration=$(LC_ALL=C awk -v d="$duration" 'BEGIN { printf "%.3f", d }')
+  else
+    duration=""
+  fi
 
   # Skip utterances that are too short. SoX silence detection can be fooled
   # by brief noise, producing tiny clips that waste API budget and add empty
@@ -1181,12 +1368,9 @@ function convert_audio_to_text() {
   # picked the input, so always honour their choice — silently dropping a
   # short clip there would be a confusing regression.
   #
-  # `|| true` keeps the assignment from poisoning $? when soxi rejects the
-  # input (e.g. invalid audio). "Unknown duration" is treated as "do not skip".
+  # An unknown duration (soxi failed) is treated as "do not skip".
   if [ -z "$AUDIO_FILE" ]; then
-    local duration
-    duration=$(soxi -D "$output_file" 2>/dev/null) || true
-    if [ -n "$duration" ] && awk -v d="$duration" -v m="$MIN_AUDIO_DURATION" 'BEGIN { exit !(d+0 > 0 && d+0 < m+0) }'; then
+    if [ -n "$duration" ] && LC_ALL=C awk -v d="$duration" -v m="$MIN_AUDIO_DURATION" 'BEGIN { exit !(d+0 > 0 && d+0 < m+0) }'; then
       rm -f "$output_file"
       return 0
     fi
@@ -1212,13 +1396,18 @@ function convert_audio_to_text() {
     fi
     transcription="$display_text"
 
+    # A record that fails to serialize is a failure, not a silent success.
+    local emit_rc=0
     if [ "$JSONL_MODE" = true ]; then
       jq -nc \
         --argjson version "$JSONL_SCHEMA_VERSION" \
+        --argjson seq "${seq:-null}" \
         --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg model "local:$(basename "$MODEL_PATH")" \
+        --argjson duration "${duration:-null}" \
         --arg text "$display_text" \
-        '{version:$version, ts:$ts, model:$model, duration:null, text:$text}'
+        '{version:$version, seq:$seq, ts:$ts, model:$model, duration:$duration, languages:null, text:$text}' \
+        || emit_rc=1
     else
       echo "$display_text"
     fi
@@ -1233,7 +1422,8 @@ function convert_audio_to_text() {
       rm -f "$output_file"
     fi
     echo "$transcription" >> "${WORK_DIR:-.}/temp_transcriptions.txt"
-    return 0
+    [ $emit_rc -ne 0 ] && echo "Warning: failed to write the JSONL record for $output_file" >&2
+    return $emit_rc
   fi
 
   # Endpoint: default to OpenAI's transcriptions URL, or use the user-supplied
@@ -1266,28 +1456,49 @@ function convert_audio_to_text() {
   # (PROMPT, LANGUAGE, file paths) are never re-interpreted by the shell.
   # -w appends the HTTP status code on its own line so non-2xx responses can
   # be rejected even when the body is not an OpenAI-style error JSON.
+  #
+  # Text fields use --form-string: with --form, curl itself would read a
+  # value starting with `<` from a file, upload one starting with `@`, and
+  # parse `;type=`. --form is kept only where that is intended (the audio
+  # upload and the speaker reference files below).
   local curl_args=(
     -s --request POST
     -w $'\n%{http_code}'
     --url "$base_url"
     --form "file=@$output_file"
-    --form "model=$MODEL"
-    --form "response_format=$response_format"
+    --form-string "model=$MODEL"
+    --form-string "response_format=$response_format"
   )
   [ -n "$auth_file" ] && curl_args=(--config "$auth_file" "${curl_args[@]}")
 
   # Prompt is supported everywhere except on gpt-4o-transcribe-diarize*
   if [ -n "$PROMPT" ] && [[ "$MODEL" != gpt-4o-transcribe-diarize* ]]; then
-    curl_args+=(--form "prompt=$PROMPT")
+    curl_args+=(--form-string "prompt=$PROMPT")
   fi
 
-  if [ -n "$LANGUAGE" ]; then
-    curl_args+=(--form "language=$LANGUAGE")
+  # gpt-transcribe takes `languages[]` (and rejects it together with the
+  # singular field); older models take one `language`. validate_config has
+  # already rejected several codes for models that accept only one.
+  parse_language_list || true
+  local lang kw
+  if [ ${#LANGUAGES[@]} -gt 0 ]; then
+    if model_takes_context_fields || [ ${#LANGUAGES[@]} -gt 1 ]; then
+      for lang in "${LANGUAGES[@]}"; do
+        curl_args+=(--form-string "languages[]=$lang")
+      done
+    else
+      curl_args+=(--form-string "language=${LANGUAGES[0]}")
+    fi
+  fi
+  if [ ${#KEYWORDS[@]} -gt 0 ]; then
+    for kw in "${KEYWORDS[@]}"; do
+      curl_args+=(--form-string "keywords[]=$kw")
+    done
   fi
 
   # Diarization-specific parameters
   if [ "$DIARIZE" = true ] && [[ "$MODEL" == gpt-4o-transcribe-diarize* ]]; then
-    curl_args+=(--form "chunking_strategy=$CHUNKING_STRATEGY")
+    curl_args+=(--form-string "chunking_strategy=$CHUNKING_STRATEGY")
 
     if [ ${#KNOWN_SPEAKERS[@]} -gt 0 ]; then
       local speakers_json="$SPEAKER_DIR/speakers.json"
@@ -1312,7 +1523,7 @@ function convert_audio_to_text() {
           chmod 600 "$ref_file"
           printf '%s' "$encoded_ref" > "$ref_file"
           speaker_ref_files+=("$ref_file")
-          curl_args+=(--form "known_speaker_names[]=$speaker_name")
+          curl_args+=(--form-string "known_speaker_names[]=$speaker_name")
           curl_args+=(--form "known_speaker_references[]=<$ref_file")
         fi
       done
@@ -1381,6 +1592,13 @@ function convert_audio_to_text() {
     else
       echo "Warning: API request failed (HTTP $http_code); skipping utterance" >&2
     fi
+    # OpenAI answers a bad language code, a bad keyword, or an over-long
+    # prompt with a bare "Invalid request." that names none of them.
+    if [ "$http_code" = "400" ] && [ "$http_detail" = "Invalid request." ] \
+       && { [ ${#LANGUAGES[@]} -gt 0 ] || [ ${#KEYWORDS[@]} -gt 0 ] || [ -n "$PROMPT" ]; }; then
+      echo "Hint: this may be caused by a --language code (use ISO 639-1 such as 'en', or 'zh-cn')," >&2
+      echo "      a --keyword term, or a --prompt that is too long." >&2
+    fi
     if [ -z "$AUDIO_FILE" ]; then
       rm -f "$output_file"
     fi
@@ -1442,16 +1660,23 @@ function convert_audio_to_text() {
 
   # Primary transcription output.
   # In JSONL mode, emit one JSON object per utterance using jq so that the
-  # text is properly escaped. Duration is null because no API model in the
-  # supported set returns audio duration.
+  # text is properly escaped. `languages` is what the model detected
+  # (gpt-transcribe; [] means it could not tell), or null when the response
+  # has no such field — never the --language hints.
+  local emit_rc=0
   if [ "$JSONL_MODE" = true ]; then
+    local detected_languages
+    detected_languages=$(echo "$response" | jq -c 'if (.languages | type) == "array" then .languages else null end' 2>/dev/null || true)
     jq -nc \
       --argjson version "$JSONL_SCHEMA_VERSION" \
+      --argjson seq "${seq:-null}" \
       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --arg model "$MODEL" \
-      --argjson duration null \
+      --argjson duration "${duration:-null}" \
+      --argjson languages "${detected_languages:-null}" \
       --arg text "$display_text" \
-      '{version:$version, ts:$ts, model:$model, duration:$duration, text:$text}'
+      '{version:$version, seq:$seq, ts:$ts, model:$model, duration:$duration, languages:$languages, text:$text}' \
+      || emit_rc=1
   else
     echo "$display_text"
   fi
@@ -1473,6 +1698,11 @@ function convert_audio_to_text() {
   # Accumulate the transcribed text in a temporary file
   # this is necessary for the data to be available when the script terminates
   echo "$transcription" >> "${WORK_DIR:-.}/temp_transcriptions.txt"
+
+  if [ $emit_rc -ne 0 ]; then
+    echo "Warning: failed to write the JSONL record for $output_file" >&2
+  fi
+  return $emit_rc
 }
 
 # Preserve the accumulated transcription in a file when no clipboard tool is
@@ -1632,6 +1862,9 @@ if [ -n "$AUDIO_FILE" ]; then
       echo "  Model: $MODEL"
     fi
     echo "  Input language: ${LANGUAGE:-Not specified}"
+    if [ ${#KEYWORDS[@]} -gt 0 ]; then
+      echo "  Keywords: ${#KEYWORDS[@]}"
+    fi
 
     if [ -n "$TRANSLATE" ]; then
       echo "  Translate to English: $TRANSLATE"
@@ -1654,7 +1887,7 @@ if [ -n "$AUDIO_FILE" ]; then
     echo ""
   fi
 
-  convert_audio_to_text "$AUDIO_FILE"
+  convert_audio_to_text "$AUDIO_FILE" 1
   handle_exit $?
 fi
 
@@ -1665,9 +1898,11 @@ display_settings
 # Main loop to continuously record audio, detect silence, and transcribe audio
 rec_failures=0  # consecutive rec-launch failures (busy-loop guard)
 spinner_pid=""
+utterance_seq=0 # capture sequence number (JSONL `seq`)
 while true; do
-  # Set the path to the output audio file
-  OUTPUT_FILE="$WORK_DIR/output_$(date +%s).mp3"
+  # The sequence number keeps chunk names unique; the work dir is per session.
+  utterance_seq=$((utterance_seq + 1))
+  OUTPUT_FILE=$(printf '%s/output_%06d.mp3' "$WORK_DIR" "$utterance_seq")
 
   # Add the output file to the array
   output_files+=("$OUTPUT_FILE")
@@ -1701,11 +1936,11 @@ while true; do
       # destabilize Metal on Apple Silicon. Serial execution keeps the
       # load predictable at the cost of slightly higher latency when
       # utterances arrive faster than whisper-cli can process them.
-      convert_audio_to_text "$OUTPUT_FILE"
+      convert_audio_to_text "$OUTPUT_FILE" "$utterance_seq"
     else
       # API backend: curl is lightweight and network-bound, so run in the
       # background and show a spinner while we record the next utterance.
-      convert_audio_to_text "$OUTPUT_FILE" &
+      convert_audio_to_text "$OUTPUT_FILE" "$utterance_seq" &
       pid=$!
       # Only show the spinner when stdout is a real terminal and we are
       # not in pipe-native mode — a spinner emitted into a pipe corrupts

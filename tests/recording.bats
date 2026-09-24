@@ -136,3 +136,37 @@ STUB
 @test "main loop counts consecutive rec failures (busy-loop regression)" {
   grep -q 'rec_failures' "$BATS_TEST_DIRNAME/../whisper-stream"
 }
+
+# --- main loop: capture sequence ------------------------------------------------
+
+@test "real-time loop numbers utterances in capture order even when replies arrive reversed" {
+  # rec emits audio twice, then fails; after 3 consecutive failures the loop
+  # exits through handle_exit, which waits for the background API calls.
+  export REC_COUNT="$BATS_TEST_TMPDIR/rec_count"
+  echo 0 > "$REC_COUNT"
+  cat > "$BATS_TEST_TMPDIR/bin/rec" <<'STUB'
+#!/usr/bin/env bash
+n=$(( $(cat "$REC_COUNT") + 1 )); echo "$n" > "$REC_COUNT"
+[ "$n" -le 2 ] || exit 1
+printf 'FAKEPCM'
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/rec"
+  # The first utterance's request is slow, so its reply arrives second.
+  cat > "$BATS_TEST_TMPDIR/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in file=@*) f="${a#file=@}" ;; esac
+done
+case "$f" in *output_000001*) sleep 2 ;; esac
+printf '{"text":"%s"}\n200' "$(basename "$f")"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+
+  run env OPENAI_API_KEY=sk-test "$BATS_TEST_DIRNAME/../whisper-stream" --jsonl
+  local records
+  records=$(printf '%s\n' "$output" | grep '^{')
+  [ "$(printf '%s\n' "$records" | wc -l | tr -d ' ')" -eq 2 ]
+  # Completion order is 2 then 1; seq still names the capture order.
+  [ "$(printf '%s\n' "$records" | sed -n 1p | jq -r '[.seq, .text] | join(" ")')" = "2 output_000002.mp3" ]
+  [ "$(printf '%s\n' "$records" | sed -n 2p | jq -r '[.seq, .text] | join(" ")')" = "1 output_000001.mp3" ]
+}
